@@ -1,6 +1,6 @@
 {
   "name": "mentored-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Mentored Content Tool backend - handles audio transcription",
   "main": "server.js",
   "scripts": {
@@ -11,8 +11,6 @@
     "cors": "^2.8.5",
     "multer": "^1.4.5-lts.1",
     "form-data": "^4.0.0",
-    "node-fetch": "^2.7.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "@ffmpeg-installer/ffmpeg": "^1.1.0"
+    "node-fetch": "^2.7.0"
   }
 }
