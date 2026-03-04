@@ -75,6 +75,46 @@ app.get('/ping', (req, res) => {
   res.json({ pong: true, time: Date.now() });
 });
 
+// ── CLAUDE API PROXY ──
+// Browser can't call Anthropic directly (CORS) — route through here
+app.post('/claude', async (req, res) => {
+  try {
+    const { anthropicKey, prompt, transcript } = req.body;
+    if (!anthropicKey) return res.status(400).json({ error: 'Missing Anthropic API key' });
+    if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+    if (!transcript) return res.status(400).json({ error: 'Missing transcript' });
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': anthropicKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4000,
+        messages: [{
+          role: 'user',
+          content: `${prompt}\n\n---TRANSCRIPT---\n${transcript}`
+        }]
+      })
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(`Claude API error (${response.status}): ${errData.error?.message || 'Check your Anthropic API key.'}`);
+    }
+
+    const data = await response.json();
+    res.json({ content: data.content[0].text });
+
+  } catch (err) {
+    console.error('Claude proxy error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── SUBMIT job ──
 app.post('/transcribe/submit', upload.single('audio'), (req, res) => {
   try {
