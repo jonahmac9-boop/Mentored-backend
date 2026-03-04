@@ -1,7 +1,7 @@
 {
   "name": "mentored-backend",
-  "version": "2.0.0",
-  "description": "Mentored Content Tool backend - handles audio transcription",
+  "version": "3.0.0",
+  "description": "Mentored Content Tool backend with job queue",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,6 +11,7 @@
     "cors": "^2.8.5",
     "multer": "^1.4.5-lts.1",
     "form-data": "^4.0.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "uuid": "^9.0.0"
   }
 }
