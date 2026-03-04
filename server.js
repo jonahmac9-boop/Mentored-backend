@@ -36,6 +36,11 @@ app.get('/', (req, res) => {
   res.json({ status: 'Mentored backend v3 running', version: '3.0.0' });
 });
 
+// ── Keepalive ping ──
+app.get('/ping', (req, res) => {
+  res.json({ pong: true, time: Date.now() });
+});
+
 // ── SUBMIT job ──
 // Browser sends file here, gets a job ID back immediately
 app.post('/transcribe/submit', upload.single('audio'), (req, res) => {
