@@ -14,17 +14,51 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// In-memory job store
-// job: { id, status: 'queued'|'processing'|'done'|'error', transcript, error, createdAt }
-const jobs = {};
+// ── Job storage directory — persists across health check restarts ──
+const JOBS_DIR = path.join(os.tmpdir(), 'mentored_jobs');
+if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR, { recursive: true });
 
-// Clean up old jobs every 30 minutes
-setInterval(() => {
-  const cutoff = Date.now() - 30 * 60 * 1000;
-  for (const id in jobs) {
-    if (jobs[id].createdAt < cutoff) delete jobs[id];
+// ── Clean up job files older than 30 minutes — runs every 10 minutes ──
+function cleanOldJobs() {
+  try {
+    const files = fs.readdirSync(JOBS_DIR);
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    let cleaned = 0;
+    for (const file of files) {
+      const filePath = path.join(JOBS_DIR, file);
+      const stat = fs.statSync(filePath);
+      if (stat.mtimeMs < cutoff) {
+        fs.unlinkSync(filePath);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) console.log(`Cleaned up ${cleaned} old job files`);
+  } catch(e) {
+    console.error('Cleanup error:', e.message);
   }
-}, 30 * 60 * 1000);
+}
+setInterval(cleanOldJobs, 10 * 60 * 1000);
+
+// ── Read job from disk ──
+function readJob(jobId) {
+  try {
+    const filePath = path.join(JOBS_DIR, `${jobId}.json`);
+    if (!fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch(e) {
+    return null;
+  }
+}
+
+// ── Write job to disk ──
+function writeJob(job) {
+  try {
+    const filePath = path.join(JOBS_DIR, `${job.id}.json`);
+    fs.writeFileSync(filePath, JSON.stringify(job), 'utf8');
+  } catch(e) {
+    console.error('Failed to write job:', e.message);
+  }
+}
 
 const upload = multer({
   dest: os.tmpdir(),
@@ -33,7 +67,7 @@ const upload = multer({
 
 // ── Health check ──
 app.get('/', (req, res) => {
-  res.json({ status: 'Mentored backend v3 running', version: '3.0.0' });
+  res.json({ status: 'Mentored backend v4 running', version: '4.0.0' });
 });
 
 // ── Keepalive ping ──
@@ -42,7 +76,6 @@ app.get('/ping', (req, res) => {
 });
 
 // ── SUBMIT job ──
-// Browser sends file here, gets a job ID back immediately
 app.post('/transcribe/submit', upload.single('audio'), (req, res) => {
   try {
     const openaiKey = req.body.openaiKey;
@@ -50,21 +83,24 @@ app.post('/transcribe/submit', upload.single('audio'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No audio file uploaded' });
 
     const jobId = uuidv4();
-    jobs[jobId] = {
+    const job = {
       id: jobId,
       status: 'queued',
+      progress: 'Job received, starting...',
       transcript: null,
       error: null,
       createdAt: Date.now()
     };
 
+    writeJob(job);
+
     const fileSizeMB = req.file.size / (1024 * 1024);
     console.log(`Job ${jobId} queued: ${req.file.originalname}, ${fileSizeMB.toFixed(1)}MB`);
 
-    // Respond immediately with job ID
+    // Respond immediately
     res.json({ jobId });
 
-    // Process in background — no await, intentionally fire-and-forget
+    // Process in background
     processJob(jobId, req.file.path, req.file.originalname, openaiKey);
 
   } catch (err) {
@@ -74,9 +110,8 @@ app.post('/transcribe/submit', upload.single('audio'), (req, res) => {
 });
 
 // ── POLL job status ──
-// Browser calls this every 5 seconds to check progress
 app.get('/transcribe/status/:jobId', (req, res) => {
-  const job = jobs[req.params.jobId];
+  const job = readJob(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json({
     jobId: job.id,
@@ -90,15 +125,18 @@ app.get('/transcribe/status/:jobId', (req, res) => {
 // ── Background processing ──
 async function processJob(jobId, filePath, originalName, openaiKey) {
   try {
-    jobs[jobId].status = 'processing';
-    jobs[jobId].progress = 'Splitting audio into chunks...';
+    let job = readJob(jobId);
+    job.status = 'processing';
+    job.progress = 'Splitting audio into chunks...';
+    writeJob(job);
 
     const fileSizeMB = fs.statSync(filePath).size / (1024 * 1024);
     const LIMIT_MB = 24;
     let fullTranscript = '';
 
     if (fileSizeMB <= LIMIT_MB) {
-      jobs[jobId].progress = 'Transcribing audio...';
+      job.progress = 'Transcribing audio...';
+      writeJob(job);
       fullTranscript = await transcribeFile(filePath, originalName, openaiKey);
     } else {
       const chunkPaths = splitFileIntoChunks(filePath, LIMIT_MB);
@@ -106,7 +144,10 @@ async function processJob(jobId, filePath, originalName, openaiKey) {
       console.log(`Job ${jobId}: split into ${total} chunks`);
 
       for (let i = 0; i < chunkPaths.length; i++) {
-        jobs[jobId].progress = `Transcribing chunk ${i + 1} of ${total}...`;
+        job = readJob(jobId); // Re-read from disk each time
+        job.progress = `Transcribing chunk ${i + 1} of ${total}...`;
+        writeJob(job);
+
         console.log(`Job ${jobId}: transcribing chunk ${i + 1}/${total}`);
         const t = await transcribeFile(chunkPaths[i], `chunk_${i}.mp3`, openaiKey);
         fullTranscript += (i > 0 ? ' ' : '') + t;
@@ -116,20 +157,26 @@ async function processJob(jobId, filePath, originalName, openaiKey) {
 
     try { fs.unlinkSync(filePath); } catch(e) {}
 
+    // Write final result to disk
+    job = readJob(jobId);
+    job.status = 'done';
+    job.progress = 'Complete';
+    job.transcript = fullTranscript;
+    writeJob(job);
+
     console.log(`Job ${jobId}: done. Transcript length: ${fullTranscript.length} chars`);
-    jobs[jobId].status = 'done';
-    jobs[jobId].transcript = fullTranscript;
-    jobs[jobId].progress = 'Complete';
 
   } catch (err) {
     try { fs.unlinkSync(filePath); } catch(e) {}
     console.error(`Job ${jobId} error:`, err.message);
-    jobs[jobId].status = 'error';
-    jobs[jobId].error = err.message;
+    const job = readJob(jobId) || { id: jobId };
+    job.status = 'error';
+    job.error = err.message;
+    writeJob(job);
   }
 }
 
-// ── Send a file to OpenAI Whisper ──
+// ── Transcribe a single file with OpenAI Whisper ──
 async function transcribeFile(filePath, filename, openaiKey) {
   const form = new FormData();
   form.append('file', fs.createReadStream(filePath), filename);
@@ -171,4 +218,4 @@ function splitFileIntoChunks(filePath, chunkSizeMB) {
   return chunkPaths;
 }
 
-app.listen(PORT, () => console.log(`Mentored backend v3 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Mentored backend v4 running on port ${PORT}`));
