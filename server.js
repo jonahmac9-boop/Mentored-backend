@@ -177,20 +177,27 @@ async function processJob(jobId, filePath, originalName, openaiKey) {
     if (fileSizeMB <= LIMIT_MB) {
       job.progress = 'Transcribing audio...';
       writeJob(job);
-      fullTranscript = await transcribeFile(filePath, originalName, openaiKey);
+      fullTranscript = await transcribeFile(filePath, originalName, openaiKey, 0);
     } else {
       const chunkPaths = splitFileIntoChunks(filePath, LIMIT_MB);
       const total = chunkPaths.length;
       console.log(`Job ${jobId}: split into ${total} chunks`);
 
+      // Detect actual bitrate from file metadata for accurate time offsets
+      const actualBitrateKbps = getMP3Bitrate(filePath);
+      console.log(`Job ${jobId}: detected bitrate ${actualBitrateKbps}kbps`);
+      const chunkSizeBytes = LIMIT_MB * 1024 * 1024;
+      const actualChunkDuration = (chunkSizeBytes * 8) / (actualBitrateKbps * 1000);
+
       for (let i = 0; i < chunkPaths.length; i++) {
-        job = readJob(jobId); // Re-read from disk each time
+        job = readJob(jobId);
         job.progress = `Transcribing chunk ${i + 1} of ${total}...`;
         writeJob(job);
 
-        console.log(`Job ${jobId}: transcribing chunk ${i + 1}/${total}`);
-        const t = await transcribeFile(chunkPaths[i], `chunk_${i}.mp3`, openaiKey);
-        fullTranscript += (i > 0 ? ' ' : '') + t;
+        console.log(`Job ${jobId}: transcribing chunk ${i + 1}/${total}, offset ${(i * actualChunkDuration).toFixed(1)}s`);
+        const timeOffset = i * actualChunkDuration;
+        const t = await transcribeFile(chunkPaths[i], `chunk_${i}.mp3`, openaiKey, timeOffset);
+        fullTranscript += (i > 0 ? '\n' : '') + t;
         try { fs.unlinkSync(chunkPaths[i]); } catch(e) {}
       }
     }
@@ -216,12 +223,14 @@ async function processJob(jobId, filePath, originalName, openaiKey) {
   }
 }
 
-// ── Transcribe a single file with OpenAI Whisper ──
-async function transcribeFile(filePath, filename, openaiKey) {
+// ── Transcribe a single file with OpenAI Whisper — returns timecoded transcript ──
+async function transcribeFile(filePath, filename, openaiKey, timeOffsetSeconds) {
   const form = new FormData();
   form.append('file', fs.createReadStream(filePath), filename);
   form.append('model', 'whisper-1');
   form.append('language', 'en');
+  form.append('response_format', 'verbose_json');
+  form.append('timestamp_granularities[]', 'segment');
 
   const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
@@ -238,7 +247,54 @@ async function transcribeFile(filePath, filename, openaiKey) {
   }
 
   const data = await response.json();
+
+  // Stitch segments with offset-adjusted timestamps
+  if (data.segments && data.segments.length > 0) {
+    return data.segments.map(seg => {
+      const rawSeconds = seg.start + timeOffsetSeconds;
+      const hours = Math.floor(rawSeconds / 3600);
+      const mins = Math.floor((rawSeconds % 3600) / 60);
+      const secs = Math.floor(rawSeconds % 60);
+      const timestamp = hours > 0
+        ? `${hours}:${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`
+        : `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+      return `[${timestamp}] ${seg.text.trim()}`;
+    }).join('\n');
+  }
+
+  // Fallback to plain text if no segments
   return data.text || '';
+}
+
+// ── Read actual bitrate from MP3 header ──
+// Reads the first valid MP3 frame header to get the real bitrate
+// Falls back to 128kbps if it can't be determined
+function getMP3Bitrate(filePath) {
+  try {
+    const buffer = Buffer.alloc(10240); // Read first 10KB
+    const fd = fs.openSync(filePath, 'r');
+    fs.readSync(fd, buffer, 0, 10240, 0);
+    fs.closeSync(fd);
+
+    // Bitrate table for MPEG1 Layer3 (standard MP3)
+    const bitrateTable = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+
+    // Scan for MP3 sync word (0xFF 0xE0 or higher)
+    for (let i = 0; i < buffer.length - 4; i++) {
+      if (buffer[i] === 0xFF && (buffer[i + 1] & 0xE0) === 0xE0) {
+        const bitrateIndex = (buffer[i + 2] >> 4) & 0x0F;
+        const bitrate = bitrateTable[bitrateIndex];
+        if (bitrate > 0) {
+          return bitrate;
+        }
+      }
+    }
+    console.log('Could not detect bitrate, defaulting to 192kbps');
+    return 192;
+  } catch (e) {
+    console.log('Bitrate detection error, defaulting to 192kbps:', e.message);
+    return 192;
+  }
 }
 
 // ── Split file into byte chunks ──
